@@ -1,0 +1,13 @@
+{
+  "name": "telegram-notif-api",
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Bot Telegram notifikasi via Express + Telegraf, siap deploy ke Vercel",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "telegraf": "^4.16.3"
+  }
+}
