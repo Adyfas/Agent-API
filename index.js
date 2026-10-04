@@ -75,11 +75,7 @@ app.use('/api/webhook', bot.webhookCallback('/api/webhook'));
 // === HEALTH CHECK ===
 app.get('/', (req, res) => res.send('Bot running!'));
 
-// === LOCAL DEV ===
-// Di Vercel, framework yang serve app ini (NODE_ENV=production), jadi listen hanya untuk local dev
-if (process.env.NODE_ENV !== 'production') {
-  const port = process.env.PORT || 3000;
-  app.listen(port, () => console.log(`Server lokal berjalan di http://localhost:${port}`));
-}
-
-export default app;
+// === START SERVER ===
+// Vercel akan menjalankan file ini sebagai server dan me-route semua request ke PORT yang diberikan
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Server berjalan di port ${port}`));
