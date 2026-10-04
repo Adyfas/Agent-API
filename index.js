@@ -14,6 +14,12 @@ bot.help((ctx) =>
   ctx.reply('Gunakan /start untuk memulai.\nNotifikasi dikirim via POST /api/send dengan body { title, content, url, chat_id? }.')
 );
 
+// === CATCH-ALL: balas "oke" untuk semua pesan teks selain command ===
+bot.on('text', (ctx) => {
+  if (ctx.message.text.startsWith('/')) return;
+  ctx.reply('oke');
+});
+
 // === SECURITY MIDDLEWARE ===
 const checkSecret = (req, res, next) => {
   if (req.headers['x-api-secret'] !== process.env.API_SECRET) {
@@ -70,7 +76,8 @@ app.post('/api/send', checkSecret, async (req, res) => {
 });
 
 // === ENDPOINT 2: WEBHOOK TELEGRAM ===
-app.use('/api/webhook', bot.webhookCallback('/api/webhook'));
+// Mount tanpa prefix path: filter Telegraf membandingkan req.url dengan '/api/webhook'
+app.use(bot.webhookCallback('/api/webhook'));
 
 // === HEALTH CHECK ===
 app.get('/', (req, res) => res.send('Bot running!'));
