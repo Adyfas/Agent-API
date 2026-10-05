@@ -14,7 +14,8 @@ bot.help((ctx) =>
   ctx.reply(
     'Perintah:\n' +
       '/start - info bot\n' +
-      '/ask <pertanyaan> - tanya AI (via OpenRouter)\n' +
+      '/ask <pertanyaan> - tanya AI + websearch (via OpenRouter)\n' +
+      '/model - pilih model AI (list/set/reset)\n' +
       '/help - bantuan ini\n\n' +
       'Notifikasi dikirim via POST /api/send dengan body { title, content, url, chat_id? }.\n' +
       'Tanya AI via API: POST /api/ask dengan body { prompt, model? }.'
@@ -36,29 +37,94 @@ const AI_SYSTEM_PROMPT =
   process.env.AI_SYSTEM_PROMPT ||
   'Kamu adalah asisten AI di Telegram. Jawab singkat, jelas, dan to the point dalam bahasa Indonesia. Gunakan plain text tanpa markdown.';
 
-const askAI = async (prompt, modelOverride) => {
+// Daftar model FREE yang support tool calling (untuk /model list)
+const AVAILABLE_MODELS = [
+  'apodex/apodex-1.1-mini:free',
+  'qwen/qwen3.8-27b:free',
+  'google/gemma-4-31b-it:free',
+  'nvidia/nemotron-3-super-120b-a12b:free',
+  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+  'inclusionai/ling-3.0-flash-sante:free',
+];
+
+// State model per chat (in-memory; reset saat server restart / cold start di Vercel)
+const chatModel = new Map();
+
+const getModelForChat = (chatId) => (chatId ? chatModel.get(chatId) : undefined);
+
+// Pecah teks panjang (>4096 char, limit Telegram) menjadi beberapa pesan
+const chunkText = (text, limit = 4096) => {
+  if (text.length <= limit) return [text];
+  const chunks = [];
+  let rest = text;
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf('\n', limit);
+    if (cut < limit / 2) cut = limit;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  if (rest) chunks.push(rest);
+  return chunks;
+};
+
+const mapOpenRouterError = (status, body) => {
+  const short = body.length > 200 ? `${body.slice(0, 200)}...` : body;
+  switch (status) {
+    case 401:
+      return 'API key OpenRouter tidak valid';
+    case 402:
+      return 'Kredit OpenRouter habis';
+    case 429:
+      return 'Rate limit, coba lagi sebentar lagi';
+    case 400:
+      return `Model tidak ditemukan atau tidak mendukung tool calling (${short})`;
+    default:
+      return `OpenRouter ${status}: ${short}`;
+  }
+};
+
+const askAI = async (prompt, modelOverride, chatId) => {
   if (!OPENROUTER_API_KEY) {
     throw new Error('OPENROUTER_API_KEY belum diset di environment variables');
   }
-  const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      'HTTP-Referer': 'https://agentadyfas.vercel.app',
-      'X-Title': 'AgentAdyfas Bot',
-    },
-    body: JSON.stringify({
-      model: modelOverride || AI_MODEL,
-      messages: [
-        { role: 'system', content: AI_SYSTEM_PROMPT },
-        { role: 'user', content: prompt },
-      ],
-    }),
-  });
+  const model = modelOverride || getModelForChat(chatId) || AI_MODEL;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 55_000);
+  let resp;
+  try {
+    resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://agentadyfas.vercel.app',
+        'X-Title': 'AgentAdyfas Bot',
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: AI_SYSTEM_PROMPT },
+          { role: 'user', content: prompt },
+        ],
+        // Server tool websearch: OpenRouter yang menjalankan search, model memutuskan kapan dipakai
+        tools: [
+          {
+            type: 'openrouter:web_search',
+            parameters: { engine: 'auto', max_results: 5, max_uses: 3 },
+          },
+        ],
+      }),
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') throw new Error('Request ke AI timeout');
+    throw new Error(`Gagal menghubungi OpenRouter: ${err.message}`);
+  }
+  clearTimeout(timer);
   if (!resp.ok) {
     const errText = await resp.text();
-    throw new Error(`OpenRouter ${resp.status}: ${errText}`);
+    throw new Error(mapOpenRouterError(resp.status, errText));
   }
   const data = await resp.json();
   return data.choices?.[0]?.message?.content?.trim() || '(response kosong)';
@@ -86,11 +152,58 @@ bot.command('ask', async (ctx) => {
   }
   const statusMsg = await ctx.reply('⏳ Sedang berpikir...');
   try {
-    const answer = await askAI(prompt);
-    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, '', answer);
+    const answer = await askAI(prompt, undefined, ctx.chat.id);
+    const chunks = chunkText(answer);
+    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, '', chunks[0]);
+    for (let i = 1; i < chunks.length; i++) {
+      await ctx.reply(chunks[i]);
+    }
   } catch (err) {
     await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, '', `⚠️ Error: ${err.message}`);
   }
+});
+
+// === COMMAND: /model — pilih model AI per chat ===
+bot.command('model', async (ctx) => {
+  const arg = (ctx.message.text || '').replace(/^\/model(@\w+)?\s*/i, '').trim();
+  const current = getModelForChat(ctx.chat.id) || AI_MODEL;
+
+  if (!arg) {
+    return ctx.reply(
+      `Model saat ini: ${current}\n\n` +
+        'Pilihan:\n' +
+        '/model list - daftar model\n' +
+        '/model set <model> - ganti model\n' +
+        '/model reset - kembali ke default\n\n' +
+        'Catatan: pilihan tersimpan di memori server, reset saat server restart.'
+    );
+  }
+
+  if (arg === 'list') {
+    return ctx.reply(
+      'Model tersedia (semua support tool calling + websearch):\n' +
+        AVAILABLE_MODELS.map((m, i) => `${i + 1}. ${m}${m === AI_MODEL ? ' (default)' : ''}`).join('\n')
+    );
+  }
+
+  if (arg === 'reset') {
+    chatModel.delete(ctx.chat.id);
+    return ctx.reply(`Model di-reset ke default: ${AI_MODEL}`);
+  }
+
+  if (arg.startsWith('set ')) {
+    const wanted = arg.slice(4).trim().toLowerCase();
+    const match = AVAILABLE_MODELS.find((m) => m.toLowerCase() === wanted);
+    if (!match) {
+      return ctx.reply(`Model "${wanted}" tidak tersedia.\nPilihan valid:\n${AVAILABLE_MODELS.join('\n')}`);
+    }
+    chatModel.set(ctx.chat.id, match);
+    return ctx.reply(`Model diganti menjadi: ${match}\nGunakan /ask untuk mencobanya.`);
+  }
+
+  return ctx.reply(
+    'Usage:\n/model - lihat model saat ini\n/model list - daftar model\n/model set <model>\n/model reset'
+  );
 });
 
 // === CATCH-ALL: balas "oke" untuk semua pesan teks selain command ===
