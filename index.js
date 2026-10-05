@@ -23,6 +23,7 @@ bot.help((ctx) =>
       '/sessions - list semua session\n' +
       '/use <id> - ganti session aktif\n' +
       '/model - pilih model AI (list/set/reset)\n' +
+      '/status - cek status bot (web, API key, usage OpenRouter, kuota)\n' +
       '/help - bantuan ini\n\n' +
       'Catatan: session & pilihan model tersimpan di memori server, hilang saat cold start.\n' +
       'Notifikasi dikirim via POST /api/send dengan body { title, content, url, chat_id? }.\n' +
@@ -182,6 +183,107 @@ const mapOpenRouterError = (status, body) => {
     default:
       return `OpenRouter ${status}: ${short}`;
   }
+};
+
+// === STATUS CHECK: web health + OpenRouter API key (/auth/key) + kredit (/credits) ===
+const fetchWithTimeout = async (url, options = {}, timeoutMs = 10000) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+// Health check endpoint bot sendiri (GET /) — ukur latensi
+const checkWebHealth = async (timeoutMs = 5000) => {
+  const port = process.env.PORT || 3000;
+  const start = Date.now();
+  try {
+    const resp = await fetchWithTimeout(`http://127.0.0.1:${port}/`, {}, timeoutMs);
+    return { ok: resp.ok, latencyMs: Date.now() - start };
+  } catch {
+    return { ok: false, latencyMs: Date.now() - start };
+  }
+};
+
+// Cek status komprehensif (parallel, tiap check punya timeout sendiri).
+// Promise.allSettled: satu check gagal tidak menggagalkan yang lain (partial data).
+// Endpoint OpenRouter untuk API key biasa (bukan management key):
+//   GET /auth/key  → validasi key + limit + free_model_daily_requests (used/limit/remaining)
+//   GET /credits   → total kredit terpakai (lifetime)
+// (Catatan: /usage & /activity tidak tersedia untuk API key biasa → 404/403)
+const checkOpenRouterStatus = async (timeoutMs = 10000) => {
+  const headers = OPENROUTER_API_KEY ? { Authorization: `Bearer ${OPENROUTER_API_KEY}` } : {};
+  const noKey = () => Promise.reject(new Error('OPENROUTER_API_KEY belum diset'));
+
+  const [web, keyResp, creditsResp] = await Promise.allSettled([
+    checkWebHealth(5000),
+    OPENROUTER_API_KEY ? fetchWithTimeout(`${OPENROUTER_API_BASE}/auth/key`, { headers }, timeoutMs) : noKey(),
+    OPENROUTER_API_KEY ? fetchWithTimeout(`${OPENROUTER_API_BASE}/credits`, { headers }, timeoutMs) : noKey(),
+  ]);
+
+  const result = {
+    web: web.status === 'fulfilled' ? web.value : { ok: false, error: web.reason?.message || 'unknown' },
+    timestamp: new Date().toISOString(),
+  };
+
+  // API key: GET /auth/key (validasi + kuota free tier harian + kredit)
+  if (keyResp.status === 'rejected') {
+    result.apiKey = {
+      valid: false,
+      error: keyResp.reason?.name === 'AbortError' ? 'OpenRouter unavailable (timeout)' : keyResp.reason?.message || 'error',
+    };
+  } else {
+    const resp = keyResp.value;
+    if (resp.status === 401 || resp.status === 403) {
+      result.apiKey = { valid: false, error: 'API key tidak valid' };
+    } else if (resp.status === 429) {
+      result.apiKey = { valid: false, error: 'rate limit (429)' }; // fallback ke counter internal
+    } else if (!resp.ok) {
+      result.apiKey = { valid: false, error: `OpenRouter HTTP ${resp.status}` };
+    } else {
+      const data = await resp.json().catch(() => ({}));
+      const d = data.data || {};
+      const freeDaily = d.free_model_daily_requests
+        ? {
+            used: Number(d.free_model_daily_requests.used) || 0,
+            limit: Number(d.free_model_daily_requests.limit) || 0,
+            remaining: Number(d.free_model_daily_requests.remaining) || 0,
+          }
+        : null;
+      result.apiKey = {
+        valid: true,
+        isFreeTier: d.is_free_tier ?? null,
+        creditUsage: d.usage ?? null,
+        creditUsageDaily: d.usage_daily ?? null,
+        creditLimit: d.limit ?? null,
+        freeDaily,
+      };
+    }
+  }
+
+  // Kredit: GET /credits (total lifetime)
+  if (creditsResp.status === 'rejected') {
+    result.credits = {
+      error:
+        creditsResp.reason?.name === 'AbortError' ? 'OpenRouter unavailable (timeout)' : creditsResp.reason?.message || 'error',
+    };
+  } else {
+    const resp = creditsResp.value;
+    if (resp.status === 429) {
+      result.credits = { error: 'rate_limit' };
+    } else if (!resp.ok) {
+      result.credits = { error: `OpenRouter HTTP ${resp.status}` };
+    } else {
+      const data = await resp.json().catch(() => ({}));
+      const d = data.data || {};
+      result.credits = { totalCredits: d.total_credits ?? null, totalUsage: d.total_usage ?? null };
+    }
+  }
+
+  return result;
 };
 
 // Deteksi query yang meminta informasi terkini (untuk memicu retry jika model tidak search)
@@ -380,6 +482,69 @@ bot.command('use', async (ctx) => {
   activeSession.set(ctx.chat.id, id);
   const s = sessions.get(id);
   await ctx.reply(`Session aktif: #${s.id} - ${s.title}`);
+});
+
+// === COMMAND: /status — status komprehensif (web + API key + usage OpenRouter + kuota) ===
+const fmtNum = (n) => Number(n || 0).toLocaleString('id-ID');
+const fmtCost = (n) => `$${Number(n || 0).toFixed(3)}`;
+
+// Format laporan status jadi MarkdownV2 (bagian dinamis di-escape)
+const formatStatusReport = (status, chatId) => {
+  const time = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+  const lines = [`📊 *Status Bot* (${escapeMarkdownV2(time)} WIB)`, ''];
+
+  lines.push(
+    status.web?.ok ? `🌐 *Web Status*: ✅ UP (${status.web.latencyMs}ms)` : '🌐 *Web Status*: ❌ DOWN'
+  );
+
+  if (status.apiKey?.valid) {
+    let line = '🔑 *API Key*: ✅ Valid';
+    if (status.apiKey.isFreeTier) line += ' (Free Tier)';
+    lines.push(line);
+    if (status.apiKey.freeDaily) {
+      const f = status.apiKey.freeDaily;
+      const note = f.remaining > 0 ? `(sisa ${fmtNum(f.remaining)})` : '(⚠️ kuota habis, reset ~00:03 WIB)';
+      lines.push(`📊 *Free Tier Hari Ini*: ${fmtNum(f.used)}/${fmtNum(f.limit)} request ${note}`);
+    }
+    if (status.credits && !status.credits.error && status.credits.totalUsage != null) {
+      lines.push(
+        `💳 *Kredit*: ${fmtCost(status.apiKey.creditUsageDaily ?? 0)} hari ini | ${fmtCost(status.credits.totalUsage)} total`
+      );
+    }
+  } else {
+    lines.push(`🔑 *API Key*: ❌ ${escapeMarkdownV2(status.apiKey?.error || 'tidak valid')}`);
+    // Fallback: kuota tetap terlihat dari counter internal di footer
+  }
+
+  lines.push('');
+  lines.push(`⚡ *Model aktif*: ${escapeMarkdownV2(getModelForChat(chatId) || AI_MODEL)}`);
+  const activeId = activeSession.get(chatId);
+  const active = activeId != null ? sessions.get(activeId) : undefined;
+  lines.push(
+    active
+      ? `💬 *Session aktif*: #${active.id} | ${escapeMarkdownV2(active.title)}`
+      : '💬 *Session aktif*: (belum ada, otomatis dibuat saat /ask)'
+  );
+
+  const u = getAiUsage();
+  lines.push(`📊 *Kuota AI hari ini*: ${u.today}/${u.limit} request (${u.percent}%)`);
+  return lines.join('\n');
+};
+
+bot.command('status', async (ctx) => {
+  const statusMsg = await ctx.reply('⏳ Mengecek status...');
+  try {
+    const status = await checkOpenRouterStatus();
+    const chunks = chunkText(formatStatusReport(status, ctx.chat.id));
+    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, '', chunks[0], {
+      parse_mode: 'MarkdownV2',
+    });
+    for (let i = 1; i < chunks.length; i++) {
+      await ctx.telegram.sendMessage(ctx.chat.id, chunks[i], { parse_mode: 'MarkdownV2' });
+    }
+  } catch (err) {
+    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, '', `⚠️ Error: ${err.message}`);
+  }
 });
 
 // === CATCH-ALL: balas "oke" untuk semua pesan teks selain command ===
