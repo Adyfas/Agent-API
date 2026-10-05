@@ -4,7 +4,11 @@ import { Telegraf } from 'telegraf';
 const app = express();
 app.use(express.json());
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+// TELEGRAM_API_BASE: hook untuk test (mock Bot API); default tetap https://api.telegram.org
+const bot = new Telegraf(
+  process.env.BOT_TOKEN,
+  process.env.TELEGRAM_API_BASE ? { telegram: { apiRoot: process.env.TELEGRAM_API_BASE } } : undefined
+);
 
 // === BOT COMMANDS ===
 bot.start((ctx) =>
@@ -14,11 +18,15 @@ bot.help((ctx) =>
   ctx.reply(
     'Perintah:\n' +
       '/start - info bot\n' +
-      '/ask <pertanyaan> - tanya AI + websearch (via OpenRouter)\n' +
+      '/ask <pertanyaan> - tanya AI + websearch (pakai session aktif + riwayat)\n' +
+      '/new <judul> - buat session baru\n' +
+      '/sessions - list semua session\n' +
+      '/use <id> - ganti session aktif\n' +
       '/model - pilih model AI (list/set/reset)\n' +
       '/help - bantuan ini\n\n' +
+      'Catatan: session & pilihan model tersimpan di memori server, hilang saat cold start.\n' +
       'Notifikasi dikirim via POST /api/send dengan body { title, content, url, chat_id? }.\n' +
-      'Tanya AI via API: POST /api/ask dengan body { prompt, model? }.'
+      'Tanya AI via API: POST /api/ask dengan body { prompt, model?, history? }.'
   )
 );
 
@@ -32,25 +40,88 @@ const checkSecret = (req, res, next) => {
 
 // === OPENROUTER AI ASSISTANT ===
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+// OPENROUTER_API_BASE: hook untuk test (mock OpenRouter); default tetap https://openrouter.ai/api/v1
+const OPENROUTER_API_BASE = (process.env.OPENROUTER_API_BASE || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
 const AI_MODEL = process.env.AI_MODEL || 'openai/gpt-4o-mini';
 const AI_SYSTEM_PROMPT =
   process.env.AI_SYSTEM_PROMPT ||
   'Kamu adalah asisten AI di Telegram. Jawab singkat, jelas, dan to the point dalam bahasa Indonesia. Gunakan plain text tanpa markdown. PENTING: Jika pertanyaan membutuhkan informasi terkini (berita, perkembangan terbaru, fakta saat ini, versi, harga, dll), kamu WAJIB memanggil tool web_search dulu, lalu menjawab berdasarkan hasil search dan mencantumkan sumber URL-nya. Jangan menjawab topik terkini dari pengetahuan lama.';
 
-// Daftar model FREE yang support tool calling (untuk /model list)
-const AVAILABLE_MODELS = [
+// Bangun system prompt dinamis: sisipkan tanggal hari ini agar query search selalu terkini
+const buildSystemPrompt = () => {
+  const now = new Date();
+  const today = now.toLocaleDateString('en-CA'); // YYYY-MM-DD
+  const monthYear = now.toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+  return (
+    `${AI_SYSTEM_PROMPT} ` +
+    `Hari ini tanggal ${today} (${monthYear}). ` +
+    `Saat memanggil web_search, selalu sertakan tanggal/bulan/tahun terkini dalam query pencarianmu agar hasil yang dikembalikan adalah yang paling baru.`
+  );
+};
+
+// Daftar model FREE default yang support tool calling (fallback jika AI_AVAILABLE_MODELS kosong)
+const DEFAULT_FREE_MODELS = [
   'apodex/apodex-1.1-mini:free',
   'qwen/qwen3.8-27b:free',
   'google/gemma-4-31b-it:free',
   'nvidia/nemotron-3-super-120b-a12b:free',
   'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
   'inclusionai/ling-3.0-flash-sante:free',
+  'nvidia/nemotron-3-ultra:free',
+  'nvidia/nemotron-3.5-lightning:free',
+  'poolside/laguna-s-2.1:free',
+  'poolside/laguna-xs-2.1:free',
+  'dots-studio/dots3-note-preview:free',
+  'thinking-machines/inkling:free',
+  'thinking-machines/inkling-small:free',
+  'cohere/north-mini-code:free',
+  'liquidai/lfm2.5-2.6b:free',
+  'space-bunny/alpha:free',
+  'nex/nex-n2.5:free',
+  'z-ai/z-model:free',
+  'deepseek/deepseek-v4-flash:free',
+  'openrouter/free',
 ];
+
+
+// Daftar model bisa diatur user via env var AI_AVAILABLE_MODELS (comma-separated)
+const AVAILABLE_MODELS = (process.env.AI_AVAILABLE_MODELS || DEFAULT_FREE_MODELS.join(','))
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 // State model per chat (in-memory; reset saat server restart / cold start di Vercel)
 const chatModel = new Map();
 
 const getModelForChat = (chatId) => (chatId ? chatModel.get(chatId) : undefined);
+
+// === SESSION STORE (in-memory; hilang saat cold start Vercel) ===
+const sessions = new Map(); // sessionId -> { id, title, messages: [{role, content}], createdAt }
+const activeSession = new Map(); // chatId -> sessionId
+let sessionCounter = 0;
+
+const createSession = (title) => {
+  sessionCounter += 1;
+  const session = {
+    id: sessionCounter,
+    title: title || `Session ${sessionCounter}`,
+    messages: [],
+    createdAt: Date.now(),
+  };
+  sessions.set(session.id, session);
+  return session;
+};
+
+// Session aktif untuk chat ini; auto-buat "Session Baru" jika belum ada
+const getActiveSession = (chatId) => {
+  const id = activeSession.get(chatId);
+  if (id != null && sessions.has(id)) return sessions.get(id);
+  const session = createSession('Session Baru');
+  activeSession.set(chatId, session.id);
+  return session;
+};
+
+const listSessions = () => [...sessions.values()].sort((a, b) => a.id - b.id);
 
 // Pecah teks panjang (>4096 char, limit Telegram) menjadi beberapa pesan
 const chunkText = (text, limit = 4096) => {
@@ -83,16 +154,16 @@ const mapOpenRouterError = (status, body) => {
   }
 };
 
-const askAI = async (prompt, modelOverride, chatId) => {
-  if (!OPENROUTER_API_KEY) {
-    throw new Error('OPENROUTER_API_KEY belum diset di environment variables');
-  }
-  const model = modelOverride || getModelForChat(chatId) || AI_MODEL;
+// Deteksi query yang meminta informasi terkini (untuk memicu retry jika model tidak search)
+const CURRENT_INFO_RE = /(terbaru|terkini|saat ini|hari ini|sekarang|kini|berita|news|carikan|cari|update|kabar|informasi|info)/i;
+
+// Satu panggilan ke OpenRouter; messages = [system, ...riwayat, user]; return { answer, searched }
+const callOpenRouter = async (model, messages, timeoutMs) => {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 55_000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let resp;
   try {
-    resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    resp = await fetch(`${OPENROUTER_API_BASE}/chat/completions`, {
       method: 'POST',
       signal: controller.signal,
       headers: {
@@ -103,10 +174,7 @@ const askAI = async (prompt, modelOverride, chatId) => {
       },
       body: JSON.stringify({
         model,
-        messages: [
-          { role: 'system', content: AI_SYSTEM_PROMPT },
-          { role: 'user', content: prompt },
-        ],
+        messages,
         // Server tool websearch: OpenRouter yang menjalankan search, model memutuskan kapan dipakai
         tools: [
           {
@@ -127,38 +195,81 @@ const askAI = async (prompt, modelOverride, chatId) => {
     throw new Error(mapOpenRouterError(resp.status, errText));
   }
   const data = await resp.json();
-  return data.choices?.[0]?.message?.content?.trim() || '(response kosong)';
+  const answer = data.choices?.[0]?.message?.content?.trim() || '(response kosong)';
+  // Sinyal reliable apakah web search benar-benar dijalankan
+  const searched =
+    (data.usage?.server_tool_use_details?.web_search_requests || 0) > 0 ||
+    (data.choices?.[0]?.message?.annotations || []).length > 0;
+  return { answer, searched };
+};
+
+// Batas riwayat yang dikirim ke model (hemat token & aman dari limit context)
+const HISTORY_LIMIT = 20;
+
+const askAI = async (prompt, modelOverride, chatId, history = []) => {
+  if (!OPENROUTER_API_KEY) {
+    throw new Error('OPENROUTER_API_KEY belum diset di environment variables');
+  }
+  const model = modelOverride || getModelForChat(chatId) || AI_MODEL;
+  const recent = history.slice(-HISTORY_LIMIT);
+  const buildMessages = (userContent) => [
+    { role: 'system', content: buildSystemPrompt() },
+    ...recent,
+    { role: 'user', content: userContent },
+  ];
+  const start = Date.now();
+  const first = await callOpenRouter(model, buildMessages(prompt), 40_000);
+  // Jika query minta info terkini tapi model tidak search (balas cepat tanpa sumber),
+  // retry sekali dengan riwayat + instruksi eksplisit. Budget total tetap < 60s (limit Vercel).
+  if (!first.searched && CURRENT_INFO_RE.test(prompt) && Date.now() - start < 20_000) {
+    const retryPrompt =
+      `Wajib gunakan tool web_search untuk mencari informasi terkini di web, ` +
+      `lalu jawab berdasarkan hasil pencarian dengan mencantumkan sumber URL.\n\n` +
+      `Pertanyaan: ${prompt}`;
+    const second = await callOpenRouter(model, buildMessages(retryPrompt), 30_000);
+    return second.answer;
+  }
+  return first.answer;
 };
 
 // === ENDPOINT 3: TANYA AI VIA API ===
 app.post('/api/ask', checkSecret, async (req, res) => {
   try {
-    const { prompt, model } = req.body || {};
+    const { prompt, model, history } = req.body || {};
     if (!prompt) {
       return res.status(400).json({ ok: false, message: 'prompt required' });
     }
-    const answer = await askAI(prompt, model);
+    // Riwayat opsional (stateless): hanya pesan user/assistant dengan content string
+    const safeHistory = Array.isArray(history)
+      ? history.filter((m) => m && typeof m.content === 'string' && (m.role === 'user' || m.role === 'assistant'))
+      : [];
+    const answer = await askAI(prompt, model, undefined, safeHistory);
     res.json({ ok: true, answer });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// === COMMAND: /ask <pertanyaan> ===
+// === COMMAND: /ask <pertanyaan> (pakai session aktif + riwayat) ===
 bot.command('ask', async (ctx) => {
   const prompt = (ctx.message.text || '').replace(/^\/ask(@\w+)?\s*/i, '').trim();
   if (!prompt) {
     return ctx.reply('Pakai format: /ask <pertanyaan>\nContoh: /ask apa itu API?');
   }
+  const session = getActiveSession(ctx.chat.id);
+  session.messages.push({ role: 'user', content: prompt });
+  const history = session.messages.slice(0, -1); // riwayat sebelum pesan ini
   const statusMsg = await ctx.reply('⏳ Sedang berpikir...');
   try {
-    const answer = await askAI(prompt, undefined, ctx.chat.id);
-    const chunks = chunkText(answer);
+    const answer = await askAI(prompt, undefined, ctx.chat.id, history);
+    session.messages.push({ role: 'assistant', content: answer });
+    const chunks = chunkText(`[Session #${session.id} | ${session.title}]\n${answer}`);
     await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, '', chunks[0]);
     for (let i = 1; i < chunks.length; i++) {
       await ctx.reply(chunks[i]);
     }
   } catch (err) {
+    // Jangan append pesan assistant: riwayat tetap valid untuk percakapan berikutnya
     await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, '', `⚠️ Error: ${err.message}`);
   }
 });
@@ -206,10 +317,44 @@ bot.command('model', async (ctx) => {
   );
 });
 
+// === COMMAND: /new <judul> — buat session baru ===
+bot.command('new', async (ctx) => {
+  const title = (ctx.message.text || '').replace(/^\/new(@\w+)?\s*/i, '').trim();
+  const session = createSession(title);
+  activeSession.set(ctx.chat.id, session.id);
+  await ctx.reply(`[Session #${session.id}] ${session.title} dibuat. Session aktif sekarang.`);
+});
+
+// === COMMAND: /sessions — list semua session ===
+bot.command('sessions', async (ctx) => {
+  const list = listSessions();
+  if (!list.length) {
+    return ctx.reply('Belum ada session. Buat dengan /new <judul>.');
+  }
+  const activeId = activeSession.get(ctx.chat.id);
+  const lines = list.map((s) =>
+    s.id === activeId ? `#${s.id} - ${s.title} (aktif)` : `#${s.id} - ${s.title} (${s.messages.length} pesan)`
+  );
+  await ctx.reply(`Session:\n${lines.join('\n')}\n\nGanti: /use <id>`);
+});
+
+// === COMMAND: /use <id> — set session aktif ===
+bot.command('use', async (ctx) => {
+  const arg = (ctx.message.text || '').replace(/^\/use(@\w+)?\s*/i, '').trim();
+  const id = Number.parseInt(arg, 10);
+  if (!Number.isInteger(id) || !sessions.has(id)) {
+    const list = listSessions().map((s) => `#${s.id} - ${s.title}`).join('\n');
+    return ctx.reply(`Session "${arg}" tidak ditemukan.\nSession tersedia:\n${list || '(belum ada)'}`);
+  }
+  activeSession.set(ctx.chat.id, id);
+  const s = sessions.get(id);
+  await ctx.reply(`Session aktif: #${s.id} - ${s.title}`);
+});
+
 // === CATCH-ALL: balas "oke" untuk semua pesan teks selain command ===
-bot.on('text', (ctx) => {
+bot.on('text', async (ctx) => {
   if (ctx.message.text.startsWith('/')) return;
-  ctx.reply('oke');
+  await ctx.reply('oke');
 });
 
 // === MARKDOWNV2 ESCAPE HELPER ===
