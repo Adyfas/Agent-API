@@ -18,7 +18,7 @@ bot.help((ctx) =>
   ctx.reply(
     'Perintah:\n' +
       '/start - info bot\n' +
-      '/ask <pertanyaan> - tanya AI + websearch (pakai session aktif + riwayat)\n' +
+      '/ask <pertanyaan> - tanya AI + websearch (session aktif + riwayat + sisa kuota harian)\n' +
       '/new <judul> - buat session baru\n' +
       '/sessions - list semua session\n' +
       '/use <id> - ganti session aktif\n' +
@@ -61,27 +61,33 @@ const buildSystemPrompt = () => {
 
 // Daftar model FREE default yang support tool calling (fallback jika AI_AVAILABLE_MODELS kosong)
 const DEFAULT_FREE_MODELS = [
-  'apodex/apodex-1.1-mini:free',
-  'qwen/qwen3.8-27b:free',
-  'google/gemma-4-31b-it:free',
-  'nvidia/nemotron-3-super-120b-a12b:free',
-  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
-  'inclusionai/ling-3.0-flash-sante:free',
-  'nvidia/nemotron-3-ultra:free',
-  'nvidia/nemotron-3.5-lightning:free',
-  'poolside/laguna-s-2.1:free',
-  'poolside/laguna-xs-2.1:free',
-  'dots-studio/dots3-note-preview:free',
-  'thinking-machines/inkling:free',
-  'thinking-machines/inkling-small:free',
-  'cohere/north-mini-code:free',
-  'liquidai/lfm2.5-2.6b:free',
-  'space-bunny/alpha:free',
-  'nex/nex-n2.5:free',
-  'z-ai/z-model:free',
-  'deepseek/deepseek-v4-flash:free',
-  'openrouter/free',
+  // 1. Router Otomatis & Model Stealth Agentic Utama
+  'openrouter/free',                                    // Mengarahkan otomatis ke model gratis yang mendukung tools
+  'space-bunny/alpha:free',                             // Model stealth premium gratis dengan dukungan native tools kuat
+  
+  // 2. Model Spesialis Agentic & Coding Tier Gratis
+  'cohere/north-mini-code:free',                        // Optimal untuk SWE-agent, mendukung tooluse via JSON schema
+  'deepseek/deepseek-v4-flash:free',                     // Latensi instan, dirancang untuk alur kerja agentic
+  'apodex/apodex-1.1-mini:free',                        // Khusus riset mandiri berbasis integrasi berkas dan tools
+  'thinking-machines/inkling:free',                     // Dibuat khusus untuk sistem agentic dan tool-use
+  'thinking-machines/inkling-small:free',               // Versi efisien untuk alur kerja agentic multimodal
+  'dots-studio/dots3-note-preview:free',                // Mendukung multi-step agent workflows secara native
+  'nvidia/nemotron-3-super-120b-a12b:free',             // Penalaran kompleks yang andal untuk multi-agent
+  'openai/gpt-oss-120b:free',                           // Varian gratis open-weight yang mendukung function calling
+
+  // 3. Model Terbuka Populer (Tier Gratis) dengan Kapabilitas Tool/Function Bawaan
+  'meta-llama/llama-3.3-70b-instruct:free',             // Llama 3.3 memiliki native tool calling bawaan yang sangat stabil
+  'meta-llama/llama-3.1-8b-instruct:free',              // Versi ringan Llama yang mendukung pemanggilan fungsi
+  'meta-llama/llama-3.1-70b-instruct:free',             // Llama 3.1 70B versi gratis dengan dukungan tools eksternal
+  'qwen/qwen-2.5-72b-instruct:free',                    // Seri Qwen 2.5 sangat andal mengeksekusi function/tool calling
+  'qwen/qwen-2.5-coder-32b-instruct:free',              // Khusus coding agent, native tool use
+  'google/gemini-flash-1.5-8b:free',                    // Gemini Flash gratis dengan integrasi tool calling via API
+  'google/gemma-2-9b-it:free',                          // Instruksi ketat yang aman untuk skema JSON / tools
+  'mistralai/mistral-7b-instruct:free',                 // Mendukung pemanggilan fungsi dasar lewat API konvensional
+  'microsoft/phi-3-medium-128k-instruct:free',          // Jendela konteks panjang untuk parsing skema tools
+  'yi/yi-1.5-34b-chat:free'                             // Model chat serbaguna yang kompatibel dengan instruksi tools
 ];
+
 
 
 // Daftar model bisa diatur user via env var AI_AVAILABLE_MODELS (comma-separated)
@@ -122,6 +128,30 @@ const getActiveSession = (chatId) => {
 };
 
 const listSessions = () => [...sessions.values()].sort((a, b) => a.id - b.id);
+
+// === PENGGUNAAN AI HARI INI (in-memory; reset saat cold start Vercel) ===
+// Limit default 50 request/hari (free tier OpenRouter); bisa diubah via env AI_DAILY_LIMIT
+const AI_DAILY_LIMIT = Number.parseInt(process.env.AI_DAILY_LIMIT, 10) || 50;
+const aiDateStr = () => new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD
+let aiUsage = { date: aiDateStr(), count: 0 };
+
+// Hitung 1 request setiap kali OpenRouter menjawab (sukses maupun error HTTP)
+const bumpAiUsage = () => {
+  const today = aiDateStr();
+  if (aiUsage.date !== today) aiUsage = { date: today, count: 0 };
+  aiUsage.count += 1;
+};
+
+const getAiUsage = () => {
+  const today = aiDateStr();
+  const count = aiUsage.date === today ? aiUsage.count : 0;
+  return { today: count, limit: AI_DAILY_LIMIT, percent: Math.round((count / AI_DAILY_LIMIT) * 100) };
+};
+
+const usageFooter = () => {
+  const u = getAiUsage();
+  return `\n\n📊 Kuota AI hari ini: ${u.today}/${u.limit} request (${u.percent}%)`;
+};
 
 // Pecah teks panjang (>4096 char, limit Telegram) menjadi beberapa pesan
 const chunkText = (text, limit = 4096) => {
@@ -190,6 +220,7 @@ const callOpenRouter = async (model, messages, timeoutMs) => {
     throw new Error(`Gagal menghubungi OpenRouter: ${err.message}`);
   }
   clearTimeout(timer);
+  bumpAiUsage(); // request sudah sampai OpenRouter → masuk kuota harian
   if (!resp.ok) {
     const errText = await resp.text();
     throw new Error(mapOpenRouterError(resp.status, errText));
@@ -244,7 +275,7 @@ app.post('/api/ask', checkSecret, async (req, res) => {
       ? history.filter((m) => m && typeof m.content === 'string' && (m.role === 'user' || m.role === 'assistant'))
       : [];
     const answer = await askAI(prompt, model, undefined, safeHistory);
-    res.json({ ok: true, answer });
+    res.json({ ok: true, answer, usage: getAiUsage() });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -262,8 +293,8 @@ bot.command('ask', async (ctx) => {
   const statusMsg = await ctx.reply('⏳ Sedang berpikir...');
   try {
     const answer = await askAI(prompt, undefined, ctx.chat.id, history);
-    session.messages.push({ role: 'assistant', content: answer });
-    const chunks = chunkText(`[Session #${session.id} | ${session.title}]\n${answer}`);
+    session.messages.push({ role: 'assistant', content: answer }); // riwayat tetap bersih (tanpa footer)
+    const chunks = chunkText(`[Session #${session.id} | ${session.title}]\n${answer}${usageFooter()}`);
     await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, '', chunks[0]);
     for (let i = 1; i < chunks.length; i++) {
       await ctx.reply(chunks[i]);
