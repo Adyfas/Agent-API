@@ -27,7 +27,8 @@ bot.help((ctx) =>
       '/help - bantuan ini\n\n' +
       'Catatan: session & pilihan model tersimpan di memori server, hilang saat cold start.\n' +
       'Notifikasi dikirim via POST /api/send dengan body { title, content, url, chat_id? }.\n' +
-      'Tanya AI via API: POST /api/ask dengan body { prompt, model?, history? }.'
+      'Tanya AI via API: POST /api/ask dengan body { prompt, model?, history? }.\n' +
+      'Cek status via API: GET /api/status (header x-api-secret).'
   )
 );
 
@@ -399,6 +400,18 @@ app.post('/api/ask', checkSecret, async (req, res) => {
       : [];
     const answer = await askAI(prompt, model, undefined, safeHistory);
     res.json({ ok: true, answer, usage: getAiUsage() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// === ENDPOINT: CEK STATUS VIA API (GET /api/status) ===
+// Untuk test lokal & monitoring: balasan berisi data status + teks laporan MarkdownV2
+// (teks yang sama persis yang dikirim command /status di Telegram)
+app.get('/api/status', checkSecret, async (req, res) => {
+  try {
+    const status = await checkOpenRouterStatus();
+    res.json({ ok: true, status, report: formatStatusReport(status, undefined) });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
