@@ -169,6 +169,27 @@ const chunkText = (text, limit = 4096) => {
   return chunks;
 };
 
+// === MARKDOWNV2 ESCAPE HELPER ===
+// Escape semua karakter khusus MarkdownV2 agar pesan tidak error saat parse
+const escapeMarkdownV2 = (text = '') =>
+  String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+
+// Strategi aman untuk pesan MarkdownV2: tulis teks polos dengan sentinel untuk
+// marker bold/italic/code, escape SELURUH teks, lalu ganti sentinel dengan
+// karakter markdown literal. Semua karakter khusus (termasuk di teks dinamis)
+// otomatis ke-escape; marker markdown tetap berfungsi.
+const MD_BOLD = '\u0000';
+const MD_ITALIC = '\u0001';
+const MD_CODE = '\u0002';
+const toMarkdownV2 = (text) =>
+  escapeMarkdownV2(text)
+    .split(MD_BOLD)
+    .join('*')
+    .split(MD_ITALIC)
+    .join('_')
+    .split(MD_CODE)
+    .join('`');
+
 const mapOpenRouterError = (status, body) => {
   const short = body.length > 200 ? `${body.slice(0, 200)}...` : body;
   switch (status) {
@@ -488,47 +509,49 @@ bot.command('use', async (ctx) => {
 const fmtNum = (n) => Number(n || 0).toLocaleString('id-ID');
 const fmtCost = (n) => `$${Number(n || 0).toFixed(3)}`;
 
-// Format laporan status jadi MarkdownV2 (bagian dinamis di-escape)
+// Format laporan status jadi MarkdownV2 (teks polos + sentinel, lihat toMarkdownV2)
 const formatStatusReport = (status, chatId) => {
   const time = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
-  const lines = [`📊 *Status Bot* (${escapeMarkdownV2(time)} WIB)`, ''];
+  const lines = [`📊 ${MD_BOLD}Status Bot${MD_BOLD} (${time} WIB)`, ''];
 
   lines.push(
-    status.web?.ok ? `🌐 *Web Status*: ✅ UP (${status.web.latencyMs}ms)` : '🌐 *Web Status*: ❌ DOWN'
+    status.web?.ok
+      ? `🌐 ${MD_BOLD}Web Status${MD_BOLD}: ✅ UP (${status.web.latencyMs}ms)`
+      : `🌐 ${MD_BOLD}Web Status${MD_BOLD}: ❌ DOWN`
   );
 
   if (status.apiKey?.valid) {
-    let line = '🔑 *API Key*: ✅ Valid';
+    let line = `🔑 ${MD_BOLD}API Key${MD_BOLD}: ✅ Valid`;
     if (status.apiKey.isFreeTier) line += ' (Free Tier)';
     lines.push(line);
     if (status.apiKey.freeDaily) {
       const f = status.apiKey.freeDaily;
       const note = f.remaining > 0 ? `(sisa ${fmtNum(f.remaining)})` : '(⚠️ kuota habis, reset ~00:03 WIB)';
-      lines.push(`📊 *Free Tier Hari Ini*: ${fmtNum(f.used)}/${fmtNum(f.limit)} request ${note}`);
+      lines.push(`📊 ${MD_BOLD}Free Tier Hari Ini${MD_BOLD}: ${fmtNum(f.used)}/${fmtNum(f.limit)} request ${note}`);
     }
     if (status.credits && !status.credits.error && status.credits.totalUsage != null) {
       lines.push(
-        `💳 *Kredit*: ${fmtCost(status.apiKey.creditUsageDaily ?? 0)} hari ini | ${fmtCost(status.credits.totalUsage)} total`
+        `💳 ${MD_BOLD}Kredit${MD_BOLD}: ${fmtCost(status.apiKey.creditUsageDaily ?? 0)} hari ini | ${fmtCost(status.credits.totalUsage)} total`
       );
     }
   } else {
-    lines.push(`🔑 *API Key*: ❌ ${escapeMarkdownV2(status.apiKey?.error || 'tidak valid')}`);
+    lines.push(`🔑 ${MD_BOLD}API Key${MD_BOLD}: ❌ ${status.apiKey?.error || 'tidak valid'}`);
     // Fallback: kuota tetap terlihat dari counter internal di footer
   }
 
   lines.push('');
-  lines.push(`⚡ *Model aktif*: ${escapeMarkdownV2(getModelForChat(chatId) || AI_MODEL)}`);
+  lines.push(`⚡ ${MD_BOLD}Model aktif${MD_BOLD}: ${getModelForChat(chatId) || AI_MODEL}`);
   const activeId = activeSession.get(chatId);
   const active = activeId != null ? sessions.get(activeId) : undefined;
   lines.push(
     active
-      ? `💬 *Session aktif*: #${active.id} | ${escapeMarkdownV2(active.title)}`
-      : '💬 *Session aktif*: (belum ada, otomatis dibuat saat /ask)'
+      ? `💬 ${MD_BOLD}Session aktif${MD_BOLD}: #${active.id} | ${active.title}`
+      : `💬 ${MD_BOLD}Session aktif${MD_BOLD}: (belum ada, otomatis dibuat saat /ask)`
   );
 
   const u = getAiUsage();
-  lines.push(`📊 *Kuota AI hari ini*: ${u.today}/${u.limit} request (${u.percent}%)`);
-  return lines.join('\n');
+  lines.push(`📊 ${MD_BOLD}Kuota AI hari ini${MD_BOLD}: ${u.today}/${u.limit} request (${u.percent}%)`);
+  return toMarkdownV2(lines.join('\n'));
 };
 
 bot.command('status', async (ctx) => {
@@ -553,28 +576,23 @@ bot.on('text', async (ctx) => {
   await ctx.reply('oke');
 });
 
-// === MARKDOWNV2 ESCAPE HELPER ===
-// Escape semua karakter khusus MarkdownV2 agar pesan tidak error saat parse
-const escapeMarkdownV2 = (text = '') =>
-  String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-
 // === FORMAT PESAN ===
 const formatMessage = ({ title, content, url }) => {
   const t = title || 'Notifikasi';
-  // Sanitasi content: ganti backtick & rapatkan whitespace agar aman di code span (monospace)
-  const c = String(content ?? '').replace(/`/g, "'").replace(/\s+/g, ' ').trim() || '-';
+  // Rapatkan whitespace agar rapi di code span (monospace)
+  const c = String(content ?? '').replace(/\s+/g, ' ').trim() || '-';
   const time = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
 
   const lines = [
-    `*${escapeMarkdownV2(t)}*`,
+    `${MD_BOLD}${t}${MD_BOLD}`,
     '────────────────',
-    `\`${c}\``,
+    `${MD_CODE}${c}${MD_CODE}`,
   ];
 
-  if (url) lines.push(`🔗 [Buka Link](${escapeMarkdownV2(url)})`);
+  if (url) lines.push(`🔗 [Buka Link](${url})`);
 
-  lines.push(`_🕒 ${escapeMarkdownV2(time)} WIB_`);
-  return lines.join('\n');
+  lines.push(`${MD_ITALIC}🕒 ${time} WIB${MD_ITALIC}`);
+  return toMarkdownV2(lines.join('\n'));
 };
 
 // === ENDPOINT 1: KIRIM NOTIFIKASI ===
