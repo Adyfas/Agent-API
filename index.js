@@ -35,7 +35,7 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const AI_MODEL = process.env.AI_MODEL || 'openai/gpt-4o-mini';
 const AI_SYSTEM_PROMPT =
   process.env.AI_SYSTEM_PROMPT ||
-  'Kamu adalah asisten AI di Telegram. Jawab singkat, jelas, dan to the point dalam bahasa Indonesia. Gunakan plain text tanpa markdown.';
+  'Kamu adalah asisten AI di Telegram. Jawab singkat, jelas, dan to the point dalam bahasa Indonesia. Gunakan plain text tanpa markdown. PENTING: Jika pertanyaan membutuhkan informasi terkini (berita, perkembangan terbaru, fakta saat ini, versi, harga, dll), kamu WAJIB memanggil tool web_search dulu, lalu menjawab berdasarkan hasil search dan mencantumkan sumber URL-nya. Jangan menjawab topik terkini dari pengetahuan lama.';
 
 // Daftar model FREE yang support tool calling (untuk /model list)
 const AVAILABLE_MODELS = [
