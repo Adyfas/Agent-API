@@ -193,13 +193,30 @@ const toMarkdownV2 = (text) =>
 
 const mapOpenRouterError = (status, body) => {
   const short = body.length > 200 ? `${body.slice(0, 200)}...` : body;
+  if (status === 429) {
+    // Ambil alasan + waktu reset dari metadata OpenRouter (X-RateLimit-Reset, ms).
+    // Metadata bisa kosong (mis. request dengan tools) → estimasi reset = 00:00 UTC berikutnya.
+    let resetWib = null;
+    let reason = 'rate limit';
+    try {
+      const err = JSON.parse(body);
+      const m = (err?.error?.message || '').match(/exceeded:\s*([^.]+)/);
+      if (m) reason = m[1].trim();
+      const resetMs = err?.error?.metadata?.headers?.['X-RateLimit-Reset'];
+      if (resetMs) resetWib = new Date(Number(resetMs)).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+    } catch {}
+    if (!resetWib) {
+      const now = new Date();
+      const nextUtcMidnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+      resetWib = nextUtcMidnight.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+    }
+    return `Rate limit (${reason}), reset: ${resetWib} WIB - coba lagi setelah itu`;
+  }
   switch (status) {
     case 401:
       return 'API key OpenRouter tidak valid';
     case 402:
       return 'Kredit OpenRouter habis';
-    case 429:
-      return 'Rate limit, coba lagi sebentar lagi';
     case 400:
       return `Model tidak ditemukan atau tidak mendukung tool calling (${short})`;
     default:
@@ -539,7 +556,7 @@ const formatStatusReport = (status, chatId) => {
     lines.push(line);
     if (status.apiKey.freeDaily) {
       const f = status.apiKey.freeDaily;
-      const note = f.remaining > 0 ? `(sisa ${fmtNum(f.remaining)})` : '(⚠️ kuota habis, reset ~00:03 WIB)';
+      const note = f.remaining > 0 ? `(sisa ${fmtNum(f.remaining)})` : '(⚠️ kuota habis, reset harian 00:00 UTC / 07:00 WIB)';
       lines.push(`📊 ${MD_BOLD}Free Tier Hari Ini${MD_BOLD}: ${fmtNum(f.used)}/${fmtNum(f.limit)} request ${note}`);
     }
     if (status.credits && !status.credits.error && status.credits.totalUsage != null) {
